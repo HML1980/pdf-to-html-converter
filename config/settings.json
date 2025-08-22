@@ -1,0 +1,24 @@
+{
+    "project": {
+        "name": "PDF to HTML Converter",
+        "version": "1.0.0",
+        "description": "雲端PDF轉HTML轉換工具"
+    },
+    "ocr": {
+        "language": "chi_tra+eng",
+        "dpi": 300,
+        "psm": 6,
+        "oem": 3
+    },
+    "output": {
+        "base_path": "./output",
+        "image_format": "png",
+        "html_template": "responsive",
+        "preserve_structure": true
+    },
+    "processing": {
+        "max_workers": 4,
+        "batch_size": 10,
+        "timeout": 300
+    }
+}

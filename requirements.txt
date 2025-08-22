@@ -1,0 +1,32 @@
+# 建立正確的requirements.txt
+cat > requirements.txt << 'EOF'
+# PDF轉HTML專案 - 雲端版本依賴套件
+
+# 核心套件 (已安裝)
+pdf2image>=1.17.0
+Pillow>=11.3.0
+pytesseract>=0.3.13
+click>=8.2.1
+tqdm>=4.67.1
+
+# 網頁處理
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# JSON和資料處理
+jsonschema>=4.19.0
+
+# 圖像處理
+opencv-python-headless>=4.8.0
+numpy>=1.25.0
+
+# 網頁框架
+flask>=3.0.0
+
+# 測試套件
+pytest>=7.4.0
+
+# 開發工具
+black>=23.9.0
+flake8>=6.0.0
+EOF
