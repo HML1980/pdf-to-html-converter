@@ -1,499 +1,486 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-OCR文字識別處理模組 - 階段3
-使用Tesseract進行中文繁體文字識別，提取座標位置資訊
+OCR處理模組
+負責對PDF頁面圖片進行文字識別，提取文字內容和位置資訊
 """
 
 import os
-import sys
 import json
 import logging
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Any
-import time
 from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
 import cv2
 import numpy as np
-
-try:
-    import pytesseract
-    from PIL import Image, ImageEnhance, ImageFilter
-    import pandas as pd
-except ImportError:
-    print("⚠️  缺少必要套件，請安裝：")
-    print("pip install pytesseract opencv-python pandas")
-    print("另外需要安裝 Tesseract OCR：")
-    print("Windows: 從 https://github.com/UB-Mannheim/tesseract/wiki 下載")
-    print("Ubuntu: sudo apt install tesseract-ocr tesseract-ocr-chi-tra")
-    print("macOS: brew install tesseract tesseract-lang")
-
+from PIL import Image, ImageEnhance
+import pytesseract
 
 class OCRProcessor:
-    """OCR文字識別處理主類別"""
+    """OCR文字識別處理器"""
     
-    def __init__(self, base_path: str = "D:/pdf-to-html-converter"):
+    def __init__(self, project_root: str = "D:/pdf-to-html-converter", 
+                 language: str = 'chi_tra+eng'):
         """
         初始化OCR處理器
         
         Args:
-            base_path: 專案根目錄路徑
+            project_root: 專案根目錄
+            language: OCR識別語言，預設為繁體中文+英文
         """
-        self.base_path = Path(base_path)
-        self.output_path = self.base_path / "output"
-        self.images_path = self.output_path / "images"
-        self.text_path = self.output_path / "text"
-        self.logs_path = self.base_path / "logs"
+        self.project_root = Path(project_root)
+        self.language = language
+        self.logger = self._setup_logger()
         
-        # 確保目錄存在
-        self.text_path.mkdir(parents=True, exist_ok=True)
-        self.logs_path.mkdir(parents=True, exist_ok=True)
-        
-        # 設置日誌
-        self._setup_logging()
-        
-        # OCR設定
-        self.tesseract_config = {
-            'lang': 'chi_tra+eng',  # 中文繁體 + 英文
-            'config': '--psm 6 --oem 3',  # 頁面分段模式 + OCR引擎模式
-            'output_type': 'dict'  # 輸出字典格式
+        # OCR設定參數
+        self.ocr_config = {
+            'psm': 6,  # Page Segmentation Mode: 6 = 單一文字區塊
+            'oem': 3,  # OCR Engine Mode: 3 = Default
+            'dpi': 300,
+            'tessdata_dir': None  # 如果需要自訂tessdata路徑
         }
         
-        # 圖片前處理參數
-        self.preprocessing = {
-            'resize_factor': 2.0,  # 放大倍數
-            'contrast_enhance': 1.2,  # 對比度增強
-            'sharpness_enhance': 1.1,  # 銳利度增強
-            'noise_reduction': True,  # 降噪
-            'binarization': True  # 二值化
+        # 文字檢測參數
+        self.text_detection_params = {
+            'min_confidence': 30,  # 最小置信度
+            'min_text_length': 1,  # 最小文字長度
+            'merge_threshold': 20,  # 合併相近文字的像素閾值
         }
         
-        self.logger.info("OCR處理器初始化完成")
+        # 支援的圖片格式
+        self.supported_formats = ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']
         
-    def _setup_logging(self):
-        """設置日誌系統"""
-        log_filename = f"ocr_processor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        log_filepath = self.logs_path / log_filename
+        self.logger.info(f"OCR處理器初始化完成，語言：{language}")
         
-        # 建立logger
-        self.logger = logging.getLogger('OCRProcessor')
-        self.logger.setLevel(logging.INFO)
+    def _setup_logger(self) -> logging.Logger:
+        """設定日誌系統"""
+        # 確保logs目錄存在
+        logs_dir = self.project_root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
         
-        # 避免重複handler
-        if not self.logger.handlers:
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
+        # 設定日誌檔案名稱
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = logs_dir / f"ocr_processor_{timestamp}.log"
+        
+        # 設定logger
+        logger = logging.getLogger('OCRProcessor')
+        logger.setLevel(logging.INFO)
+        
+        # 避免重複處理器
+        if logger.handlers:
+            return logger
             
-            # 檔案handler
-            file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
-            file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
-            
-            # 終端機handler
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(formatter)
-            self.logger.addHandler(console_handler)
-    
-    def check_tesseract_installation(self) -> Tuple[bool, str]:
+        # 檔案處理器
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        
+        # 控制台處理器
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # 設定格式
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        return logger
+        
+    def preprocess_image(self, image_path: str) -> np.ndarray:
         """
-        檢查Tesseract安裝狀態
-        
-        Returns:
-            (是否安裝, 訊息)
-        """
-        try:
-            # 檢查Tesseract可執行檔
-            version = pytesseract.get_tesseract_version()
-            
-            # 檢查語言包
-            languages = pytesseract.get_languages()
-            
-            has_chi_tra = 'chi_tra' in languages
-            has_eng = 'eng' in languages
-            
-            if has_chi_tra and has_eng:
-                msg = f"✅ Tesseract {version} 已安裝，支援中文繁體和英文"
-                self.logger.info(msg)
-                return True, msg
-            else:
-                missing_langs = []
-                if not has_chi_tra:
-                    missing_langs.append('chi_tra')
-                if not has_eng:
-                    missing_langs.append('eng')
-                    
-                msg = f"❌ 缺少語言包: {', '.join(missing_langs)}"
-                self.logger.warning(msg)
-                return False, msg
-                
-        except Exception as e:
-            msg = f"❌ Tesseract未安裝或配置錯誤: {str(e)}"
-            self.logger.error(msg)
-            return False, msg
-    
-    def preprocess_image(self, image_path: str) -> Image.Image:
-        """
-        圖片前處理以提高OCR識別率
+        圖片預處理以提升OCR效果
         
         Args:
-            image_path: 圖片檔案路徑
+            image_path: 圖片路徑
             
         Returns:
-            處理後的PIL Image物件
+            處理後的圖片陣列
         """
         try:
-            # 載入圖片
-            image = Image.open(image_path)
+            # 讀取圖片
+            image = cv2.imread(image_path)
+            if image is None:
+                raise ValueError(f"無法讀取圖片: {image_path}")
+                
+            # 轉換為RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(image_rgb)
             
-            # 轉換為RGB模式
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            # 增強對比度
+            enhancer = ImageEnhance.Contrast(pil_image)
+            enhanced_image = enhancer.enhance(1.2)
             
-            # 放大圖片提高解析度
-            if self.preprocessing['resize_factor'] != 1.0:
-                new_size = (
-                    int(image.width * self.preprocessing['resize_factor']),
-                    int(image.height * self.preprocessing['resize_factor'])
-                )
-                image = image.resize(new_size, Image.Resampling.LANCZOS)
+            # 增強銳利度
+            sharpness_enhancer = ImageEnhance.Sharpness(enhanced_image)
+            sharp_image = sharpness_enhancer.enhance(1.1)
             
-            # 對比度增強
-            if self.preprocessing['contrast_enhance'] != 1.0:
-                enhancer = ImageEnhance.Contrast(image)
-                image = enhancer.enhance(self.preprocessing['contrast_enhance'])
+            # 轉回numpy陣列
+            processed_array = np.array(sharp_image)
             
-            # 銳利度增強
-            if self.preprocessing['sharpness_enhance'] != 1.0:
-                enhancer = ImageEnhance.Sharpness(image)
-                image = enhancer.enhance(self.preprocessing['sharpness_enhance'])
-            
-            # 降噪處理
-            if self.preprocessing['noise_reduction']:
-                image = image.filter(ImageFilter.MedianFilter(size=3))
+            # 轉換為灰階
+            gray = cv2.cvtColor(processed_array, cv2.COLOR_RGB2GRAY)
             
             # 二值化處理
-            if self.preprocessing['binarization']:
-                # 轉換為OpenCV格式進行二值化
-                cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-                
-                # 自適應二值化
-                binary = cv2.adaptiveThreshold(
-                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY, 11, 2
-                )
-                
-                # 轉換回PIL格式
-                image = Image.fromarray(binary)
-                image = image.convert('RGB')
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
-            return image
+            # 降噪處理
+            denoised = cv2.medianBlur(binary, 3)
+            
+            return denoised
             
         except Exception as e:
-            self.logger.error(f"圖片前處理失敗: {str(e)}")
-            # 返回原始圖片
-            return Image.open(image_path)
-    
+            self.logger.error(f"圖片預處理失敗: {e}")
+            raise
+            
     def extract_text_with_coordinates(self, image_path: str) -> Dict[str, Any]:
         """
-        從圖片中提取文字和座標資訊
+        從圖片提取文字和座標資訊
         
         Args:
-            image_path: 圖片檔案路徑
+            image_path: 圖片路徑
             
         Returns:
-            包含文字和座標資訊的字典
+            包含文字和位置資訊的字典
         """
         try:
-            self.logger.info(f"開始OCR識別: {Path(image_path).name}")
-            
-            # 前處理圖片
+            # 預處理圖片
             processed_image = self.preprocess_image(image_path)
             
-            # 執行OCR識別 - 取得詳細資料
-            ocr_data = pytesseract.image_to_data(
-                processed_image,
-                lang=self.tesseract_config['lang'],
-                config=self.tesseract_config['config'],
+            # 構建Tesseract配置
+            custom_config = f'--oem {self.ocr_config["oem"]} --psm {self.ocr_config["psm"]}'
+            
+            # 使用pytesseract進行OCR，獲取詳細資訊
+            data = pytesseract.image_to_data(
+                processed_image, 
+                lang=self.language,
+                config=custom_config,
                 output_type=pytesseract.Output.DICT
             )
             
-            # 解析OCR結果
-            text_blocks = []
-            page_text = ""
+            # 處理識別結果
+            text_elements = []
+            n_boxes = len(data['level'])
             
-            for i in range(len(ocr_data['text'])):
-                text = ocr_data['text'][i].strip()
+            for i in range(n_boxes):
+                confidence = int(data['conf'][i])
+                text = data['text'][i].strip()
                 
-                # 過濾空文字和低信心度文字
-                confidence = int(ocr_data['conf'][i])
-                if text and confidence > 30:  # 信心度閾值
-                    
-                    # 座標資訊
-                    x = ocr_data['left'][i]
-                    y = ocr_data['top'][i]
-                    width = ocr_data['width'][i]
-                    height = ocr_data['height'][i]
-                    
-                    # 估算字體大小（基於高度）
-                    font_size = max(8, min(72, int(height * 0.75)))
-                    
-                    # 文字區塊資訊
-                    text_block = {
-                        'text': text,
-                        'x': x,
-                        'y': y,
-                        'width': width,
-                        'height': height,
-                        'confidence': confidence,
-                        'font_size': font_size,
-                        'level': ocr_data['level'][i],  # 文字層級（字元、詞、行、段落等）
-                        'block_num': ocr_data['block_num'][i],
-                        'par_num': ocr_data['par_num'][i],
-                        'line_num': ocr_data['line_num'][i],
-                        'word_num': ocr_data['word_num'][i]
-                    }
-                    
-                    text_blocks.append(text_block)
-                    page_text += text + " "
+                # 過濾低置信度和空文字
+                if (confidence < self.text_detection_params['min_confidence'] or 
+                    len(text) < self.text_detection_params['min_text_length']):
+                    continue
+                
+                # 提取位置資訊
+                x = int(data['left'][i])
+                y = int(data['top'][i])
+                width = int(data['width'][i])
+                height = int(data['height'][i])
+                
+                # 估算字體大小（基於高度）
+                font_size = max(12, int(height * 0.8))
+                
+                text_element = {
+                    'text': text,
+                    'x': x,
+                    'y': y,
+                    'width': width,
+                    'height': height,
+                    'font_size': font_size,
+                    'confidence': confidence,
+                    'level': data['level'][i],
+                    'page_num': data['page_num'][i],
+                    'block_num': data['block_num'][i],
+                    'par_num': data['par_num'][i],
+                    'line_num': data['line_num'][i],
+                    'word_num': data['word_num'][i]
+                }
+                
+                text_elements.append(text_element)
             
-            # 組織結果
+            # 獲取完整文字內容
+            full_text = pytesseract.image_to_string(
+                processed_image, 
+                lang=self.language,
+                config=custom_config
+            ).strip()
+            
+            # 獲取原始圖片尺寸
+            original_image = Image.open(image_path)
+            image_width, image_height = original_image.size
+            
             result = {
                 'image_path': str(image_path),
-                'image_name': Path(image_path).name,
-                'processing_time': datetime.now().isoformat(),
-                'total_text_blocks': len(text_blocks),
-                'full_text': page_text.strip(),
-                'text_blocks': text_blocks,
-                'image_dimensions': {
-                    'original_width': processed_image.width,
-                    'original_height': processed_image.height
-                },
-                'ocr_config': self.tesseract_config,
-                'preprocessing_applied': self.preprocessing
+                'image_width': image_width,
+                'image_height': image_height,
+                'full_text': full_text,
+                'text_elements': text_elements,
+                'total_elements': len(text_elements),
+                'language': self.language,
+                'ocr_config': self.ocr_config.copy(),
+                'timestamp': datetime.now().isoformat()
             }
             
-            self.logger.info(f"OCR完成: 識別到 {len(text_blocks)} 個文字區塊")
+            self.logger.info(f"成功提取 {len(text_elements)} 個文字元素，圖片：{image_path}")
             return result
             
         except Exception as e:
-            error_msg = f"OCR識別失敗: {str(e)}"
-            self.logger.error(error_msg)
-            return {
-                'image_path': str(image_path),
-                'error': error_msg,
-                'text_blocks': [],
-                'full_text': ""
-            }
-    
-    def detect_image_regions(self, image_path: str) -> List[Dict[str, Any]]:
+            self.logger.error(f"文字提取失敗: {e}")
+            raise
+            
+    def merge_nearby_text_elements(self, text_elements: List[Dict]) -> List[Dict]:
         """
-        檢測圖片中的非文字區域（圖表、圖片等）
+        合併相近的文字元素（可選功能）
         
         Args:
-            image_path: 圖片檔案路徑
+            text_elements: 文字元素列表
             
         Returns:
-            圖片區域列表
+            合併後的文字元素列表
+        """
+        if not text_elements:
+            return text_elements
+            
+        # 按行分組（相近的y座標）
+        lines = []
+        threshold = self.text_detection_params['merge_threshold']
+        
+        for element in sorted(text_elements, key=lambda x: x['y']):
+            # 尋找相近的行
+            found_line = False
+            for line in lines:
+                if abs(element['y'] - line[0]['y']) <= threshold:
+                    line.append(element)
+                    found_line = True
+                    break
+                    
+            if not found_line:
+                lines.append([element])
+        
+        # 在每行內按x座標排序
+        merged_elements = []
+        for line in lines:
+            sorted_line = sorted(line, key=lambda x: x['x'])
+            merged_elements.extend(sorted_line)
+            
+        return merged_elements
+        
+    def process_page_image(self, image_path: str, pdf_name: str, page_num: int) -> Dict[str, Any]:
+        """
+        處理單一頁面圖片
+        
+        Args:
+            image_path: 頁面圖片路徑
+            pdf_name: PDF檔案名稱
+            page_num: 頁面編號
+            
+        Returns:
+            處理結果
         """
         try:
-            # 載入圖片
-            image = cv2.imread(image_path)
-            if image is None:
-                return []
-                
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            self.logger.info(f"開始處理頁面 {page_num}：{image_path}")
             
-            # 使用邊緣檢測找出可能的圖片區域
-            edges = cv2.Canny(gray, 50, 150)
+            # 檢查檔案是否存在
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"圖片檔案不存在: {image_path}")
+                
+            # 執行OCR
+            ocr_result = self.extract_text_with_coordinates(image_path)
             
-            # 尋找輪廓
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 合併相近文字元素（可選）
+            if self.text_detection_params.get('merge_nearby', False):
+                ocr_result['text_elements'] = self.merge_nearby_text_elements(
+                    ocr_result['text_elements']
+                )
             
-            image_regions = []
+            # 添加頁面資訊
+            ocr_result['pdf_name'] = pdf_name
+            ocr_result['page_number'] = page_num
             
-            for i, contour in enumerate(contours):
-                # 計算輪廓面積
-                area = cv2.contourArea(contour)
-                
-                # 過濾太小的區域
-                if area < 1000:  # 可調整閾值
-                    continue
-                
-                # 取得邊界矩形
-                x, y, w, h = cv2.boundingRect(contour)
-                
-                # 計算長寬比
-                aspect_ratio = float(w) / h
-                
-                # 估算是否為圖片區域（基於面積和長寬比）
-                is_likely_image = area > 5000 and 0.2 < aspect_ratio < 5.0
-                
-                region = {
-                    'region_id': f"img_region_{i:03d}",
-                    'x': int(x),
-                    'y': int(y),
-                    'width': int(w),
-                    'height': int(h),
-                    'area': int(area),
-                    'aspect_ratio': round(aspect_ratio, 2),
-                    'is_likely_image': is_likely_image,
-                    'confidence': min(100, int((area / 10000) * 100))  # 簡單的信心度計算
-                }
-                
-                image_regions.append(region)
+            # 儲存結果到JSON檔案
+            self.save_ocr_result(ocr_result, pdf_name, page_num)
             
-            # 按面積排序（大到小）
-            image_regions.sort(key=lambda x: x['area'], reverse=True)
-            
-            self.logger.info(f"檢測到 {len(image_regions)} 個可能的圖片區域")
-            return image_regions
+            return ocr_result
             
         except Exception as e:
-            self.logger.error(f"圖片區域檢測失敗: {str(e)}")
-            return []
-    
-    def process_single_image(self, image_path: str) -> Dict[str, Any]:
-        """
-        處理單張圖片（文字識別 + 圖片區域檢測）
-        
-        Args:
-            image_path: 圖片檔案路徑
+            self.logger.error(f"處理頁面 {page_num} 失敗: {e}")
+            raise
             
-        Returns:
-            完整處理結果
-        """
-        start_time = time.time()
-        
-        # 文字識別
-        text_result = self.extract_text_with_coordinates(image_path)
-        
-        # 圖片區域檢測
-        image_regions = self.detect_image_regions(image_path)
-        
-        # 組合結果
-        result = {
-            **text_result,
-            'image_regions': image_regions,
-            'processing_time_seconds': round(time.time() - start_time, 2)
-        }
-        
-        return result
-    
-    def save_ocr_results(self, results: Dict[str, Any], output_path: str):
+    def save_ocr_result(self, ocr_result: Dict[str, Any], pdf_name: str, page_num: int):
         """
         儲存OCR結果到JSON檔案
         
         Args:
-            results: OCR處理結果
-            output_path: 輸出檔案路徑
+            ocr_result: OCR處理結果
+            pdf_name: PDF檔案名稱  
+            page_num: 頁面編號
         """
         try:
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # 建立輸出目錄
+            output_dir = self.project_root / "output" / "text" / pdf_name
+            output_dir.mkdir(parents=True, exist_ok=True)
             
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
+            # 建立檔案名稱
+            json_filename = f"page_{page_num:03d}.json"
+            json_path = output_dir / json_filename
             
-            self.logger.info(f"OCR結果已儲存: {output_path}")
+            # 儲存JSON檔案
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(ocr_result, f, ensure_ascii=False, indent=2)
+                
+            self.logger.info(f"OCR結果已儲存：{json_path}")
             
         except Exception as e:
-            self.logger.error(f"儲存OCR結果失敗: {str(e)}")
-    
-    def process_pdf_images(self, pdf_name: str, progress_callback=None) -> Tuple[bool, str, List[str]]:
+            self.logger.error(f"儲存OCR結果失敗: {e}")
+            raise
+            
+    def process_pdf_images(self, pdf_name: str, images_dir: Optional[str] = None) -> Dict[str, Any]:
         """
-        處理PDF對應的所有圖片頁面
+        處理PDF的所有頁面圖片
         
         Args:
-            pdf_name: PDF檔案名稱（不含副檔名）
-            progress_callback: 進度回調函數
+            pdf_name: PDF檔案名稱
+            images_dir: 圖片目錄路徑（可選）
             
         Returns:
-            (成功與否, 訊息, 結果檔案路徑列表)
+            處理統計資訊
         """
         try:
-            # 尋找圖片目錄
-            images_dir = self.images_path / pdf_name
+            # 確定圖片目錄
+            if images_dir is None:
+                images_dir = self.project_root / "output" / "images" / pdf_name
+            else:
+                images_dir = Path(images_dir)
+                
             if not images_dir.exists():
-                return False, f"找不到圖片目錄: {images_dir}", []
-            
-            # 尋找圖片檔案
-            image_files = list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg"))
-            
+                raise FileNotFoundError(f"圖片目錄不存在: {images_dir}")
+                
+            # 尋找所有圖片檔案
+            image_files = []
+            for ext in self.supported_formats:
+                pattern = f"*{ext}"
+                image_files.extend(list(images_dir.glob(pattern)))
+                
             if not image_files:
-                return False, f"目錄中沒有圖片檔案: {images_dir}", []
-            
+                raise FileNotFoundError(f"在 {images_dir} 中找不到圖片檔案")
+                
             # 排序檔案
             image_files.sort()
             
-            # 建立輸出目錄
-            text_output_dir = self.text_path / pdf_name
-            text_output_dir.mkdir(exist_ok=True)
+            self.logger.info(f"找到 {len(image_files)} 個圖片檔案，開始OCR處理")
             
-            print(f"🔍 開始OCR處理: {pdf_name}")
-            print(f"📁 處理 {len(image_files)} 個圖片檔案")
+            # 處理統計
+            stats = {
+                'total_pages': len(image_files),
+                'processed_pages': 0,
+                'failed_pages': 0,
+                'total_text_elements': 0,
+                'start_time': datetime.now().isoformat(),
+                'failed_pages_list': []
+            }
             
-            result_files = []
-            total_files = len(image_files)
-            
+            # 逐頁處理
             for i, image_file in enumerate(image_files, 1):
-                print(f"🔄 處理圖片 {i}/{total_files}: {image_file.name}")
-                
-                # 執行OCR處理
-                result = self.process_single_image(str(image_file))
-                
-                # 儲存結果
-                result_filename = f"{image_file.stem}_ocr.json"
-                result_path = text_output_dir / result_filename
-                self.save_ocr_results(result, str(result_path))
-                
-                result_files.append(str(result_path))
-                
-                # 進度回調
-                if progress_callback:
-                    progress_callback(i, total_files, result_path)
-                
-                # 顯示處理統計
-                if 'text_blocks' in result:
-                    text_count = len(result['text_blocks'])
-                    region_count = len(result.get('image_regions', []))
-                    print(f"   ✅ 識別文字區塊: {text_count}, 圖片區域: {region_count}")
+                try:
+                    result = self.process_page_image(str(image_file), pdf_name, i)
+                    stats['processed_pages'] += 1
+                    stats['total_text_elements'] += result['total_elements']
+                    
+                    # 顯示進度
+                    progress = (i / len(image_files)) * 100
+                    self.logger.info(f"進度: {progress:.1f}% ({i}/{len(image_files)})")
+                    
+                except Exception as e:
+                    self.logger.error(f"處理頁面 {i} 失敗: {e}")
+                    stats['failed_pages'] += 1
+                    stats['failed_pages_list'].append({
+                        'page': i,
+                        'file': str(image_file),
+                        'error': str(e)
+                    })
+                    
+            stats['end_time'] = datetime.now().isoformat()
+            stats['success_rate'] = (stats['processed_pages'] / stats['total_pages']) * 100
             
-            success_msg = f"✅ OCR處理完成！處理了 {total_files} 個檔案"
-            print(success_msg)
+            # 儲存處理統計
+            self._save_processing_stats(stats, pdf_name)
             
-            return True, success_msg, result_files
+            self.logger.info(f"OCR處理完成！成功: {stats['processed_pages']}, 失敗: {stats['failed_pages']}")
+            
+            return stats
             
         except Exception as e:
-            error_msg = f"❌ OCR批次處理失敗: {str(e)}"
-            self.logger.error(error_msg)
-            return False, error_msg, []
+            self.logger.error(f"處理PDF圖片失敗: {e}")
+            raise
+            
+    def _save_processing_stats(self, stats: Dict[str, Any], pdf_name: str):
+        """儲存處理統計資訊"""
+        try:
+            output_dir = self.project_root / "output" / "text" / pdf_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            stats_file = output_dir / "ocr_stats.json"
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+                
+        except Exception as e:
+            self.logger.error(f"儲存統計資訊失敗: {e}")
+            
+    def validate_tesseract_installation(self) -> bool:
+        """
+        驗證Tesseract安裝狀態
+        
+        Returns:
+            是否安裝正確
+        """
+        try:
+            version = pytesseract.get_tesseract_version()
+            self.logger.info(f"Tesseract版本: {version}")
+            
+            # 檢查語言支援
+            languages = pytesseract.get_languages()
+            required_langs = self.language.split('+')
+            
+            missing_langs = []
+            for lang in required_langs:
+                if lang not in languages:
+                    missing_langs.append(lang)
+                    
+            if missing_langs:
+                self.logger.warning(f"缺少語言支援: {missing_langs}")
+                return False
+                
+            self.logger.info("Tesseract安裝驗證成功")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Tesseract驗證失敗: {e}")
+            return False
 
 
 def main():
-    """測試用主函數"""
-    print("🔍 OCR文字識別處理器測試")
+    """測試OCR處理器功能"""
+    print("🔍 OCR處理器測試")
     print("=" * 50)
     
-    # 初始化處理器
-    processor = OCRProcessor()
-    
-    # 檢查Tesseract安裝
-    is_installed, message = processor.check_tesseract_installation()
-    print(message)
-    
-    if not is_installed:
-        print("\n⚠️  請先安裝Tesseract OCR和中文語言包")
-        return
-    
-    # 顯示設定資訊
-    print(f"📁 文字輸出目錄: {processor.text_path}")
-    print(f"🈵 支援語言: {processor.tesseract_config['lang']}")
-    print("=" * 50)
-    
-    print("✅ OCR處理器已準備就緒！")
-    print("💡 使用方式：")
-    print("   processor = OCRProcessor()")
-    print("   success, msg, files = processor.process_pdf_images('your_pdf_name')")
+    try:
+        # 建立OCR處理器
+        ocr = OCRProcessor()
+        
+        # 驗證Tesseract安裝
+        if not ocr.validate_tesseract_installation():
+            print("❌ Tesseract安裝驗證失敗，請檢查安裝狀態")
+            return
+            
+        print("✅ OCR處理器初始化成功")
+        print(f"📁 專案目錄: {ocr.project_root}")
+        print(f"🌐 支援語言: {ocr.language}")
+        
+    except Exception as e:
+        print(f"❌ 初始化失敗: {e}")
 
 
 if __name__ == "__main__":
